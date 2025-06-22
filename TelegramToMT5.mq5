@@ -1,27 +1,26 @@
 //+------------------------------------------------------------------+
-//|                                              TelegramSignalEA.mq5|
-//|         Custom: XAUUSD Signal Parser + Multi-Order Execution     |
+//|                   TelegramToMT5.mq5                              |
+//|     Receives signals from Telegram, places and manages orders    |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, HanniballBarros"
-#property version   "2.00"
+#property version   "2.0"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Telegram.mqh>
 
-// Adjust these for your use
+// ====== USER CONFIGURATION ======
 input string   TelegramBotToken = "<YOUR_BOT_TOKEN>"; // <- paste your bot token here
-input string   SignalGroup      = "@YourGroupName";   // <- Telegram group username (or use chat_id)
+input string   SignalGroup      = "@YourGroupName";   // <- Telegram group username or chat_id as string
 input double   RiskPercent      = 2.5;                // Risk per signal (% of balance)
 input double   RiskSplit1       = 0.5;                // 50% for TP1
 input double   RiskSplit2       = 0.3;                // 30% for TP2
 input double   RiskSplit3       = 0.2;                // 20% for TP3
 input int      UpdateInterval   = 1;                  // Check for updates every X seconds
 
-CTrade         trade;
-CTradingBot   *g_bot = NULL;
+CTrade trade;
+CTradingBot *g_bot = NULL;
 
-// Structure to hold parsed signal
 struct SignalData {
    string symbol;
    string direction; // "BUY" or "SELL"
@@ -34,14 +33,15 @@ struct SignalData {
    bool   valid;
 };
 
-// Structure to track active signal/orders
 struct ManagedSignal {
    SignalData signal;
-   ulong      ticket[3];
+   ulong      order[3];      // Pending order tickets
+   ulong      position[3];   // Opened position tickets
    double     lots[3];
-   double     open_price[3];
+   double     entry_price;
    bool       tp_hit[3];
    bool       active;
+   bool       pending_executed[3];
 };
 
 ManagedSignal active_signal;
@@ -78,7 +78,19 @@ void OnDeinit(const int reason) {
 //+------------------------------------------------------------------+
 void OnTimer() {
    CheckNewMessages();
-   ManageActiveSignal();
+   // Comment active signal status for monitoring
+   if(active_signal.active) {
+      string status = "Signal: " + active_signal.signal.symbol + " " + active_signal.signal.direction + "\n";
+      for(int i=0;i<3;i++) {
+         status += StringFormat("Order %d: pending=%s, pos=%s, TP hit=%s\n", i+1,
+            (active_signal.order[i]>0?"YES":"NO"),
+            (active_signal.position[i]>0?"YES":"NO"),
+            (active_signal.tp_hit[i]?"YES":"NO"));
+      }
+      Comment(status);
+   } else {
+      Comment("No active signal");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -130,7 +142,6 @@ void CheckNewMessages() {
 //| Group filter: Only accept from your group                        |
 //+------------------------------------------------------------------+
 bool IsGroupMatch(CCustomChat *chat) {
-   // Match by group username or chat_id
    if(StringLen(SignalGroup) && chat.m_new_one.chat_username == SignalGroup) return true;
    if(chat.m_new_one.chat_id == StrToInteger(SignalGroup)) return true;
    return false;
@@ -158,14 +169,12 @@ SignalData ParseSignal(const string &txt, ulong chat_id, int msg_id) {
    int n = StringSplit(text, '\n', lines);
    if(n < 5) return sdata;
 
-   // 1st line: e.g. XAUUSD SELL
    string header[];
    int nh = StringSplit(lines[0], ' ', header);
    if(nh < 2) return sdata;
    sdata.symbol = StringTrim(header[0]);
    sdata.direction = StringTrim(header[1]);
 
-   // Find ENTRY, SL, TPs
    for(int i=1; i<n; i++) {
       string l = StringTrim(lines[i]);
       if(StringFind(l, "ENTRY") == 0) {
@@ -198,7 +207,6 @@ SignalData ParseSignal(const string &txt, ulong chat_id, int msg_id) {
          }
       }
    }
-   // Validation
    if((sdata.direction == "SELL" || sdata.direction == "BUY") &&
       sdata.entryLow > 0 && sdata.sl > 0 && sdata.tp[0] > 0) {
       sdata.valid = true;
@@ -207,31 +215,178 @@ SignalData ParseSignal(const string &txt, ulong chat_id, int msg_id) {
 }
 
 //+------------------------------------------------------------------+
-//| Place three orders for the parsed signal                         |
+//| Place three pending orders for the parsed signal                 |
 //+------------------------------------------------------------------+
 void PlaceSignalOrders(SignalData &signal) {
+   ArrayInitialize(active_signal.order, 0);
+   ArrayInitialize(active_signal.position, 0);
+   ArrayInitialize(active_signal.tp_hit, false);
+   ArrayInitialize(active_signal.pending_executed, false);
+   active_signal.signal = signal;
+   active_signal.active = true;
+   active_signal.entry_price = (signal.entryLow + signal.entryHigh) / 2.0;
+
    double risk = bankroll * (RiskPercent/100.0);
    double risk1 = risk * RiskSplit1;
    double risk2 = risk * RiskSplit2;
    double risk3 = risk * RiskSplit3;
 
-   double entry = (signal.entryLow + signal.entryHigh) / 2.0;
-   ENUM_ORDER_TYPE order_type = (signal.direction == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   double entry = active_signal.entry_price;
+   ENUM_ORDER_TYPE order_type;
+   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
+   int magic = 12345;
 
-   // Calculate lot sizes for each order (simple method, you may want to use more advanced logic)
-   double lot1 = CalculateLots(signal.symbol, risk1, entry, signal.sl, order_type);
-   double lot2 = CalculateLots(signal.symbol, risk2, entry, signal.sl, order_type);
-   double lot3 = CalculateLots(signal.symbol, risk3, entry, signal.sl, order_type);
+   double lot1 = CalculateLots(signal.symbol, risk1, entry, signal.sl, signal.direction);
+   double lot2 = CalculateLots(signal.symbol, risk2, entry, signal.sl, signal.direction);
+   double lot3 = CalculateLots(signal.symbol, risk3, entry, signal.sl, signal.direction);
+   active_signal.lots[0]=lot1; active_signal.lots[1]=lot2; active_signal.lots[2]=lot3;
 
-   ulong tickets[3] = {0,0,0};
-   double open_prices[3] = {0,0,0};
+   double last_ask = SymbolInfoDouble(signal.symbol, SYMBOL_ASK);
+   double last_bid = SymbolInfoDouble(signal.symbol, SYMBOL_BID);
 
-   // Place three market orders
-   double price = SymbolInfoDouble(signal.symbol, (order_type == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID);
-   double sl = signal.sl, tp1 = signal.tp[0], tp2 = signal.tp[1], tp3 = signal.tp[2];
+   ENUM_ORDER_TYPE pending_types[3];
+   for(int i=0;i<3;i++) {
+      // TP1, TP2, TP3
+      double tp = signal.tp[i];
+      ulong ticket = 0;
+      if(signal.direction == "BUY") {
+         if(entry < last_ask)
+            order_type = ORDER_TYPE_BUY_LIMIT;
+         else
+            order_type = ORDER_TYPE_BUY_STOP;
+         ticket = PlacePending(signal.symbol, order_type, active_signal.lots[i], entry, signal.sl, tp, magic+i);
+      } else {
+         if(entry > last_bid)
+            order_type = ORDER_TYPE_SELL_LIMIT;
+         else
+            order_type = ORDER_TYPE_SELL_STOP;
+         ticket = PlacePending(signal.symbol, order_type, active_signal.lots[i], entry, signal.sl, tp, magic+i);
+      }
+      active_signal.order[i] = ticket;
+      pending_types[i] = order_type;
+   }
+   Print("Three pending orders placed for signal: ", signal.symbol, " ", signal.direction);
+}
 
-   // Order 1 (for TP1)
-   if(trade.PositionOpen(signal.symbol, order_type, lot1, price, sl, tp1, "Signal TP1")) {
-      tickets[0] = trade.ResultOrder();
-      open_prices[0] =*
-
+//+------------------------------------------------------------------+
+//| Place a pending order and return its ticket                      |
+//+------------------------------------------------------------------+
+ulong PlacePending(string symbol, ENUM_ORDER_TYPE order_type, double lot, double price, double sl, double tp, int magic) {
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
+   req.action = TRADE_ACTION_PENDING;
+   req.symbol = symbol;
+   req.volume = lot;
+   req.price = price;
+   req.sl = sl;
+   req.tp = tp;
+   req.deviation = 20;
+   req.magic = magic;
+   req.type = order_type;
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.type_time = ORDER_TIME_GTC;
+   OrderSend(req,res);
+   if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
+      return res.order;
+   else
+      Print("Failed to place order: ", res.comment);
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk                                 |
+//+------------------------------------------------------------------+
+double CalculateLots(string symbol, double risk_amount, double entry, double sl, string direction) {
+   double contract_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double stop_loss = MathAbs(entry - sl);
+   if(stop_loss < point) stop_loss = point * 10;
+   double lot = risk_amount / (stop_loss * contract_size / point);
+   lot = NormalizeDouble(lot, 2);
+   if(lot < SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN)) lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+//| Event handler: trade/order/position events                       |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result) {
+   // Track when pending orders become positions
+   if(trans.type == TRADE_TRANSACTION_ORDER_ADD && trans.order_type > 2 && active_signal.active) {
+      // Pending order placed, nothing to do
+   }
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && active_signal.active) {
+      // Pending executed? See if a new position is opened from our order
+      for(int i=0;i<3;i++) {
+         if(active_signal.order[i] > 0 &&
+            (trans.order == active_signal.order[i] || trans.position == active_signal.position[i] || trans.position == 0)
+         ) {
+            // Find open position from this order
+            for(int j=0;j<PositionsTotal();j++) {
+               ulong pos_ticket = PositionGetTicket(j);
+               if(PositionGetInteger(POSITION_MAGIC) == 12345+i &&
+                  PositionGetString(POSITION_SYMBOL) == active_signal.signal.symbol &&
+                  MathAbs(PositionGetDouble(POSITION_VOLUME) - active_signal.lots[i]) < 0.00001) {
+                  active_signal.position[i] = pos_ticket;
+                  active_signal.order[i] = 0; // clear pending
+                  break;
+               }
+            }
+         }
+      }
+   }
+   // Trailing & move SL logic: when TP1/TP2 hit, update other SLs
+   for(int i=0;i<3;i++) {
+      ulong pos_ticket = active_signal.position[i];
+      if(pos_ticket == 0) continue;
+      if(!PositionSelectByTicket(pos_ticket)) continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      double pos_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      double pos_tp    = PositionGetDouble(POSITION_TP);
+      double pos_sl    = PositionGetDouble(POSITION_SL);
+      double last_bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+      double last_ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+      bool is_buy = (active_signal.signal.direction == "BUY");
+      double tp1 = active_signal.signal.tp[0];
+      double tp2 = active_signal.signal.tp[1];
+      double entry = active_signal.entry_price;
+
+      // Check for TP1 hit
+      if(!active_signal.tp_hit[0] && ((is_buy && last_bid >= tp1) || (!is_buy && last_ask <= tp1))) {
+         active_signal.tp_hit[0] = true;
+         // Move SL for 2 and 3 to entry
+         for(int j=1;j<3;j++) {
+            if(active_signal.position[j] > 0 && PositionSelectByTicket(active_signal.position[j])) {
+               trade.PositionModify(symbol, entry, PositionGetDouble(POSITION_TP));
+               Print("TP1 hit, moved SL for order ", j+1, " to entry");
+            }
+         }
+      }
+      // Check for TP2 hit
+      if(!active_signal.tp_hit[1] && ((is_buy && last_bid >= tp2) || (!is_buy && last_ask <= tp2))) {
+         active_signal.tp_hit[1] = true;
+         // Move SL for order 3 to TP1
+         if(active_signal.position[2] > 0 && PositionSelectByTicket(active_signal.position[2])) {
+            trade.PositionModify(symbol, tp1, PositionGetDouble(POSITION_TP));
+            Print("TP2 hit, moved SL for last order to TP1");
+         }
+      }
+   }
+   // Deactivate signal if all positions closed
+   int open = 0;
+   for(int i=0;i<3;i++) if(active_signal.position[i]>0 && PositionSelectByTicket(active_signal.position[i])) open++;
+   if(open == 0) active_signal.active = false;
+}
+
+//+------------------------------------------------------------------+
+//| Custom CTradingBot inherits from CCustomBot                      |
+//+------------------------------------------------------------------+
+class CTradingBot : public CCustomBot {
+public:
+   virtual void ProcessMessages(void) {
+      // Overridden, logic handled in EA for now
+   }
+};
+//+------------------------------------------------------------------+
